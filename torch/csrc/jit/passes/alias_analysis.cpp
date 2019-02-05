@@ -20,6 +20,41 @@ bool shouldAnnotate(const TypePtr& type) {
 bool shouldAnnotate(const Value* v) {
   return shouldAnnotate(v->type());
 }
+
+std::unordered_set<Node*> getMatchingWaits(Value* fut) {
+  std::unordered_set<Node*> ret;
+
+  // Collect all uses of the future.
+  for (const auto& use : fut->uses()) {
+    const auto user = use.user;
+
+    // If the user is a `wait`, add it to the return set
+    if (user->kind() == aten::wait) {
+      ret.insert(user);
+
+      // Otherwise, it is being passed through a block return and we need to
+      // find the corresponding value in the outer node
+      // e.g.:
+      //   %fut.1 : Future[T] = prim::if(...) {
+      //     %fut : Future[T] = prim::fork(%subgraph)
+      //     -> (%fut)
+      //   }
+      //
+      // We need to now find `fut.1`s corresponding wait.
+    } else if (user->kind() == prim::Return) {
+      const auto outerNode = user->owningBlock()->owningNode();
+      AT_ASSERT(outerNode);
+
+      const auto outerFut = outerNode->outputs().at(use.offset);
+      AT_ASSERT(outerFut->type()->kind() == TypeKind::FutureType);
+      const auto outerWaits = getMatchingWaits(outerFut);
+      ret.insert(outerWaits.cbegin(), outerWaits.cend());
+    } else {
+      AT_ASSERTM(false, "Unexpected node using a future");
+    }
+  }
+  return ret;
+}
 } // namespace
 
 AliasDb::~AliasDb() = default;
@@ -531,8 +566,9 @@ void AliasDb::analyzeFork(Node* node) {
   // values will eventually emerge.
   const auto fut = node->output();
   const auto subgraphWrites = getWrites(subgraph->block());
-  for (const auto& use : fut->uses()) {
-    const auto wait = use.user;
+  const auto matchingWaits = getMatchingWaits(fut);
+
+  for (const auto wait : matchingWaits) {
     AT_ASSERT(wait->outputs().size() == subgraph->outputs().size());
 
     // Propagate aliasing info.
